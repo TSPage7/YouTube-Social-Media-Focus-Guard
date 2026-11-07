@@ -6,6 +6,7 @@ let schedules = [];
 let approvedContent = [];
 let bankRemainingMs = 0;
 let bypassEndsAt = null;
+let otherDevicesMs = 0;
 
 const DAILY_BANK_MS = 60 * 60 * 1000;
 
@@ -42,6 +43,7 @@ async function loadData() {
   approvedContent = data.approvedContent || [];
   bankRemainingMs = data.remainingMs ?? DAILY_BANK_MS;
   bypassEndsAt = data.bypassEndsAt || null;
+  otherDevicesMs = data.otherDevicesMs || 0;
 
   if (data.apiKey) {
     document.getElementById('api-key-input').value = data.apiKey;
@@ -68,6 +70,9 @@ function renderBank() {
   document.getElementById('bank-label').textContent = active ? 'Bypass running' : 'Daily time bank';
   document.querySelector('.bank-card').classList.toggle('active', active);
   document.getElementById('end-bypass-btn').style.display = active ? 'block' : 'none';
+  const otherMins = Math.round(otherDevicesMs / 60_000);
+  document.getElementById('bank-sub').textContent =
+    otherMins > 0 ? `Includes ${otherMins} min used on your other computers today` : '';
 
   if (active) {
     const headerStatus = document.getElementById('header-status');
@@ -87,6 +92,7 @@ document.getElementById('end-bypass-btn').addEventListener('click', async () => 
   const state = await sendMsg({ type: 'END_BYPASS' });
   bankRemainingMs = state.remainingMs;
   bypassEndsAt = state.bypassEndsAt;
+  otherDevicesMs = state.otherDevicesMs || 0;
   updateBlockStatus();
   renderBank();
 });

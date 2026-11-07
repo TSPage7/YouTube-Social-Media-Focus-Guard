@@ -84,10 +84,67 @@ function extractContentId(url, site) {
   }
 }
 
+// --- Synced storage ---
+// Schedules, approvals and each computer's time-bank usage live in chrome.storage.sync, shared by
+// every computer signed into this Chrome profile. API keys, the clock offset and the device ID stay
+// in chrome.storage.local.
+
+const APPROVED_PREFIX = 'approved:';
+const USAGE_PREFIX = 'usage:';
+const MAX_APPROVALS = 200; // chrome.storage.sync holds about 100 KB in total
+
+let deviceIdPromise = null;
+function getDeviceId() {
+  deviceIdPromise ??= (async () => {
+    let { deviceId } = await chrome.storage.local.get('deviceId');
+    if (!deviceId) {
+      deviceId = crypto.randomUUID();
+      await chrome.storage.local.set({ deviceId });
+    }
+    return deviceId;
+  })();
+  return deviceIdPromise;
+}
+
+async function getSchedules() {
+  const { schedules = [] } = await chrome.storage.sync.get('schedules');
+  return schedules;
+}
+
+function approvalKey(site, id) {
+  return `${APPROVED_PREFIX}${site}:${id}`;
+}
+
+async function getApprovals() {
+  const all = await chrome.storage.sync.get(null);
+  return Object.entries(all)
+    .filter(([key]) => key.startsWith(APPROVED_PREFIX))
+    .map(([, value]) => value)
+    .sort((a, b) => a.approvedAt - b.approvedAt);
+}
+
+// One key per approval, so two computers approving at once can't overwrite each other.
+// The oldest approvals are dropped once the cap is reached, to stay inside the sync quota.
+async function addApproval(item) {
+  const approvals = await getApprovals();
+  const overflow = approvals.length + 1 - MAX_APPROVALS;
+  if (overflow > 0) {
+    await chrome.storage.sync.remove(approvals.slice(0, overflow).map(a => approvalKey(a.site, a.id)));
+  }
+  await chrome.storage.sync.set({
+    [approvalKey(item.site, item.id)]: {
+      ...item,
+      url: item.url?.slice(0, 500),
+      title: item.title?.slice(0, 100),
+      reason: item.reason?.slice(0, 200)
+    }
+  });
+}
+
 // --- Schedule check ---
 
 async function isCurrentlyBlocked() {
-  const { schedules = [] } = await chrome.storage.local.get('schedules');
+  const schedules = await getSchedules();
   const now = new Date();
   const day = now.getDay();
   const mins = now.getHours() * 60 + now.getMinutes();
@@ -102,8 +159,9 @@ async function isCurrentlyBlocked() {
 async function isApproved(url, site) {
   const contentId = extractContentId(url, site);
   if (!contentId) return false;
-  const { approvedContent = [] } = await chrome.storage.local.get('approvedContent');
-  return approvedContent.some(c => c.id === contentId && c.site === site);
+  const key = approvalKey(site, contentId);
+  const { [key]: approval } = await chrome.storage.sync.get(key);
+  return !!approval;
 }
 
 // --- Daily time bank ---
@@ -130,10 +188,10 @@ async function syncClock(force = false) {
   } catch {}
 }
 
-async function trustedNow() {
-  const { clockOffsetMs = 0, bypassStartedAt = null, bypassLastSeen = 0 } =
-    await chrome.storage.local.get(['clockOffsetMs', 'bypassStartedAt', 'bypassLastSeen']);
-  return Math.max(Date.now() + clockOffsetMs, bypassStartedAt ? bypassLastSeen : 0);
+async function trustedNow(bypassRunning) {
+  const { clockOffsetMs = 0, bypassLastSeen = 0 } =
+    await chrome.storage.local.get(['clockOffsetMs', 'bypassLastSeen']);
+  return Math.max(Date.now() + clockOffsetMs, bypassRunning ? bypassLastSeen : 0);
 }
 
 function dayKey(ms) {
@@ -147,44 +205,87 @@ function dayNumber(key) {
   return y * 10_000 + m * 100 + d;
 }
 
-// Only a later day refills the bank, so winding the clock back can't trigger a second refill
-function isNewDay(now, timeBank) {
-  return dayNumber(dayKey(now)) > dayNumber(timeBank.date);
+function startOfDay(ms) {
+  return new Date(ms).setHours(0, 0, 0, 0);
 }
 
-// Returns { remainingMs, bypassEndsAt }. Refills the bank on a new day and settles an expired bypass.
+// Only a later day refills the bank, so winding the clock back can't trigger a second refill
+function isNewDay(now, usage) {
+  return dayNumber(dayKey(now)) > dayNumber(usage.date);
+}
+
+function isToday(now, usage) {
+  return dayNumber(dayKey(now)) === dayNumber(usage.date);
+}
+
+// --- Shared bank across computers ---
+// Each computer records its own usage under usage:<deviceId>, and the bank is 60 minutes minus
+// everyone's usage today. A computer only ever writes its own key, so two can't overwrite each
+// other, and bypasses running on two computers at once drain the shared bank twice as fast.
+
+function blankUsage(now) {
+  return { date: dayKey(now), usedMs: 0, bypassStartedAt: null };
+}
+
+// Time a usage record has spent today, counting a running bypass up to `now`
+function usageMs(usage, now) {
+  if (!isToday(now, usage)) return 0;
+  const running = usage.bypassStartedAt
+    ? Math.max(0, now - Math.max(usage.bypassStartedAt, startOfDay(now)))
+    : 0;
+  return usage.usedMs + running;
+}
+
+async function myUsageKey() {
+  return USAGE_PREFIX + await getDeviceId();
+}
+
+// Returns { remainingMs, bypassEndsAt, otherDevicesMs }. Refills on a new day and settles an expired bypass.
 // bypassEndsAt is in local-clock time, since that's what alarms and the page timers run on.
 async function getBankState() {
-  let now = await trustedNow();
-  let { timeBank = { date: dayKey(now), usedMs: 0 }, bypassStartedAt = null } =
-    await chrome.storage.local.get(['timeBank', 'bypassStartedAt']);
+  const myKey = await myUsageKey();
+  const synced = await chrome.storage.sync.get(null);
+  let now = await trustedNow(!!synced[myKey]?.bypassStartedAt);
+  let mine = synced[myKey] ?? blankUsage(now);
   let changed = false;
   let expired = false;
 
-  if (isNewDay(now, timeBank)) {
+  if (isNewDay(now, mine)) {
     // Re-check against the server so a clock moved forward can't fake a new day
     await syncClock();
-    now = await trustedNow();
+    now = await trustedNow(!!mine.bypassStartedAt);
   }
-  if (isNewDay(now, timeBank)) {
+  if (isNewDay(now, mine)) {
     // A bypass running across midnight only counts from midnight
-    timeBank = { date: dayKey(now), usedMs: 0 };
-    if (bypassStartedAt) bypassStartedAt = Math.max(bypassStartedAt, new Date(now).setHours(0, 0, 0, 0));
+    mine = {
+      ...blankUsage(now),
+      bypassStartedAt: mine.bypassStartedAt && Math.max(mine.bypassStartedAt, startOfDay(now))
+    };
     changed = true;
   }
 
-  let remainingMs = DAILY_BANK_MS - timeBank.usedMs - (bypassStartedAt ? now - bypassStartedAt : 0);
-  if (bypassStartedAt && remainingMs <= 0) {
-    timeBank.usedMs = DAILY_BANK_MS;
-    bypassStartedAt = null;
+  const others = Object.entries(synced)
+    .filter(([key]) => key.startsWith(USAGE_PREFIX) && key !== myKey)
+    .map(([, usage]) => usage);
+  const otherDevicesMs = others.reduce((sum, usage) => sum + usageMs(usage, now), 0);
+  const othersRunning = others.filter(u => u.bypassStartedAt && isToday(now, u)).length;
+
+  let remainingMs = DAILY_BANK_MS - otherDevicesMs - usageMs(mine, now);
+  if (mine.bypassStartedAt && remainingMs <= 0) {
+    // Charge only what was left, so the shared total stops at 60 minutes
+    mine = { ...mine, usedMs: Math.max(mine.usedMs, DAILY_BANK_MS - otherDevicesMs), bypassStartedAt: null };
     changed = expired = true;
   }
-  if (changed || bypassStartedAt) {
-    await chrome.storage.local.set({ timeBank, bypassStartedAt, bypassLastSeen: now });
-  }
+  if (changed) await chrome.storage.sync.set({ [myKey]: mine });
+  if (mine.bypassStartedAt) await chrome.storage.local.set({ bypassLastSeen: now });
 
   remainingMs = Math.max(0, remainingMs);
-  const state = { remainingMs, bypassEndsAt: bypassStartedAt ? Date.now() + remainingMs : null };
+  const state = {
+    remainingMs,
+    // Other computers' running bypasses drain the same bank, so this one ends sooner
+    bypassEndsAt: mine.bypassStartedAt ? Date.now() + remainingMs / (1 + othersRunning) : null,
+    otherDevicesMs
+  };
   if (expired) {
     applyBypassUi(state);
     broadcastBypassChange();
@@ -196,22 +297,24 @@ async function startBypass() {
   await syncClock(true);
   const state = await getBankState();
   if (state.bypassEndsAt || state.remainingMs <= 0) return state;
-  const { clockOffsetMs = 0 } = await chrome.storage.local.get('clockOffsetMs');
-  const now = Date.now() + clockOffsetMs;
-  await chrome.storage.local.set({ bypassStartedAt: now, bypassLastSeen: now });
+
+  const myKey = await myUsageKey();
+  const { [myKey]: mine } = await chrome.storage.sync.get(myKey);
+  const now = await trustedNow(false);
+  await chrome.storage.local.set({ bypassLastSeen: now });
+  await chrome.storage.sync.set({ [myKey]: { ...(mine ?? blankUsage(now)), bypassStartedAt: now } });
   return onBypassChanged();
 }
 
 // Ending early saves the remaining time; every open blocked tab re-locks via the broadcast
 async function endBypass() {
-  const state = await getBankState();
+  const state = await getBankState(); // settles rollover and expiry first
   if (!state.bypassEndsAt) return state;
 
-  const { timeBank } = await chrome.storage.local.get('timeBank');
-  await chrome.storage.local.set({
-    timeBank: { ...timeBank, usedMs: DAILY_BANK_MS - state.remainingMs },
-    bypassStartedAt: null
-  });
+  const myKey = await myUsageKey();
+  const { [myKey]: mine } = await chrome.storage.sync.get(myKey);
+  const now = await trustedNow(true);
+  await chrome.storage.sync.set({ [myKey]: { ...mine, usedMs: usageMs(mine, now), bypassStartedAt: null } });
   return onBypassChanged();
 }
 
@@ -251,6 +354,16 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'bypass-end' || alarm.name === 'bypass-tick') {
     await syncClock();
     applyBypassUi(await getBankState());
+  }
+});
+
+// A schedule, an approval or another computer's bank usage changed: refresh the badge and open tabs
+chrome.storage.onChanged.addListener(async (changes, area) => {
+  if (area !== 'sync') return;
+  const myKey = await myUsageKey();
+  if (Object.keys(changes).some(key => key !== myKey)) {
+    applyBypassUi(await getBankState());
+    broadcastBypassChange();
   }
 });
 
@@ -604,18 +717,14 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       if (result.approved && contentUrl) {
         const contentId = extractContentId(contentUrl, site);
         if (contentId) {
-          const { approvedContent = [] } = await chrome.storage.local.get('approvedContent');
-          if (!approvedContent.some(c => c.id === contentId && c.site === site)) {
-            approvedContent.push({
-              id: contentId,
-              site,
-              url: contentUrl,
-              title: contentData.title || contentData.socialText?.slice(0, 80) || contentUrl,
-              reason: msg.reason,
-              approvedAt: Date.now()
-            });
-            await chrome.storage.local.set({ approvedContent });
-          }
+          await addApproval({
+            id: contentId,
+            site,
+            url: contentUrl,
+            title: contentData.title || contentData.socialText?.slice(0, 80) || contentUrl,
+            reason: msg.reason,
+            approvedAt: Date.now()
+          });
         }
       }
 
@@ -626,18 +735,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 
   if (msg.type === 'GET_DATA') {
     (async () => {
-      const data = await chrome.storage.local.get(['schedules', 'approvedContent', 'apiKey', 'googleApiKey']);
-      // Backwards-compat: merge old approvedVideos into approvedContent if present
-      if (data.approvedVideos?.length && !data.approvedContent?.length) {
-        data.approvedContent = data.approvedVideos.map(v => ({ ...v, site: 'youtube' }));
-      }
-      respond({ ...data, ...(await getBankState()) });
+      const keys = await chrome.storage.local.get(['apiKey', 'googleApiKey']);
+      respond({
+        ...keys,
+        schedules: await getSchedules(),
+        approvedContent: await getApprovals(),
+        ...(await getBankState())
+      });
     })();
     return true;
   }
 
   if (msg.type === 'SAVE_SCHEDULES') {
-    chrome.storage.local.set({ schedules: msg.schedules }, () => respond({ ok: true }));
+    chrome.storage.sync.set({ schedules: msg.schedules }).then(() => respond({ ok: true }));
     return true;
   }
 
@@ -652,18 +762,16 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   }
 
   if (msg.type === 'CLEAR_APPROVED') {
-    chrome.storage.local.set({ approvedContent: [] }, () => respond({ ok: true }));
+    (async () => {
+      const approvals = await getApprovals();
+      await chrome.storage.sync.remove(approvals.map(a => approvalKey(a.site, a.id)));
+      respond({ ok: true });
+    })();
     return true;
   }
 
   if (msg.type === 'REMOVE_APPROVED') {
-    (async () => {
-      const { approvedContent = [] } = await chrome.storage.local.get('approvedContent');
-      await chrome.storage.local.set({
-        approvedContent: approvedContent.filter(c => !(c.id === msg.contentId && c.site === msg.site))
-      });
-      respond({ ok: true });
-    })();
+    chrome.storage.sync.remove(approvalKey(msg.site, msg.contentId)).then(() => respond({ ok: true }));
     return true;
   }
 });

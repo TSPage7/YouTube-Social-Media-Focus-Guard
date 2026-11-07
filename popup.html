@@ -261,7 +261,9 @@
     .bank-bar { height: 4px; background: #262626; border-radius: 2px; overflow: hidden; }
     #bank-bar-fill { height: 100%; width: 100%; background: #22c55e; transition: width 0.3s; }
     .bank-card.active #bank-bar-fill { background: #fbbf24; }
-    .bank-card .btn { margin-top: 10px; }    .status-bypass { background: rgba(251,191,36,0.12); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+    .bank-card .btn { margin-top: 10px; }
+    .bank-sub { font-size: 11px; color: #666; margin-top: 6px; }
+    .bank-sub:empty { display: none; }    .status-bypass { background: rgba(251,191,36,0.12); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
   </style>
 </head>
 <body>
@@ -290,6 +292,7 @@
         <span id="bank-time" class="bank-time">60:00</span>
       </div>
       <div class="bank-bar"><div id="bank-bar-fill"></div></div>
+      <div id="bank-sub" class="bank-sub"></div>
       <button class="btn btn-secondary" id="end-bypass-btn" style="display:none">End bypass &amp; save remaining time</button>
     </div>
 
@@ -370,7 +373,8 @@
     <p style="color:#555;font-size:12px;line-height:1.7;">
       During a blocked period, YouTube will show a request form.<br>
       Submit a video URL + reason — Claude checks the title, thumbnail, description, tags, and transcript to judge productivity.<br>
-      Approved videos are tracked per session. Only exact video IDs are whitelisted.
+      Approved videos are tracked per session. Only exact video IDs are whitelisted.<br>
+      Schedules, approvals and the daily time bank sync across every computer signed into this Chrome profile. API keys stay on this computer.
     </p>
   </div>
 

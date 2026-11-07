@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Focus Guard",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Block distracting sites on a schedule. Claude AI evaluates access requests, with a daily 60-minute bypass bank.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmgeYbRHR9+WHAa3QQ8NR/DytYaft3tS4NTyBI0gGuQ01n2UwxjxN5OU2vsW6d2NfWBvLKhgucFKA+OvQrsHs4xbgzFJYMdeOBT2wao2AkjuUlF+bmw5SGVxuErWMg3ab/QSyblCeid9D8N5NET7pZrLQGYNij+cVOEczLKa4K6BzfGW4vau+UsQMQQlRldL037F2aR2JhbDnMEXnUdVwUq8n9YybBkfSxu4z7jTkFxs39s7qh+VIwnMS2voG6CHUQLBSmGanSBttxtJIPXMERu7GNy4jWnPa3HYufmwaaG+Hc5wWZVqaOOc9GBChABkwVMWZQaYZ2r8//Mw2wA0WJQIDAQAB",
   "permissions": ["storage", "tabs", "alarms", "scripting"],
   "host_permissions": [
     "*://*.youtube.com/*",
